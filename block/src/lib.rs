@@ -432,6 +432,7 @@ pub enum ImageType {
     FixedVhd,
     Qcow2,
     Raw,
+    TensorlakeRootfs,
     Vhdx,
     #[default]
     Unknown,
@@ -443,6 +444,7 @@ impl fmt::Display for ImageType {
             ImageType::FixedVhd => write!(f, "vhd"),
             ImageType::Qcow2 => write!(f, "qcow2"),
             ImageType::Raw => write!(f, "raw"),
+            ImageType::TensorlakeRootfs => write!(f, "tensorlake-rootfs"),
             ImageType::Vhdx => write!(f, "vhdx"),
             ImageType::Unknown => write!(f, "unknown"),
         }
@@ -461,6 +463,7 @@ impl FromStr for ImageType {
             "vhd" => Ok(ImageType::FixedVhd),
             "qcow2" => Ok(ImageType::Qcow2),
             "raw" => Ok(ImageType::Raw),
+            "tensorlake-rootfs" => Ok(ImageType::TensorlakeRootfs),
             "vhdx" => Ok(ImageType::Vhdx),
             _ => Err(ImageTypeParseError::InvalidValue(s.to_string())),
         }

@@ -1383,7 +1383,7 @@ impl DiskConfig {
          rate_limit_group=<group_id>,\
          queue_affinity=<list_of_queue_indices_with_their_associated_cpuset>,\
          serial=<serial_number>,backing_files=on|off,sparse=on|off,\
-         image_type=<raw,qcow2,vhd,vhdx>,lock_granularity=byte-range|full";
+         image_type=<raw,qcow2,tensorlake-rootfs,vhd,vhdx>,lock_granularity=byte-range|full";
 
     pub fn parse(disk: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
