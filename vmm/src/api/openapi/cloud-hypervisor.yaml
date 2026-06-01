@@ -971,7 +971,7 @@ components:
 
     ImageType:
       type: string
-      enum: ["FixedVhd", "Qcow2", "Raw", "Vhdx", "Unknown"]
+      enum: ["FixedVhd", "Qcow2", "Raw", "TensorlakeRootfs", "Vhdx", "Unknown"]
 
     LockGranularity:
       type: string

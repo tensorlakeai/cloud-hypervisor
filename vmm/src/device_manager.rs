@@ -2732,6 +2732,7 @@ impl DeviceManager {
 
             let opened = open_disk(&DiskOpenOptions {
                 path: disk_path,
+                image_type: disk_cfg.image_type,
                 readonly: disk_cfg.readonly,
                 direct: disk_cfg.direct,
                 sparse: disk_cfg.sparse,

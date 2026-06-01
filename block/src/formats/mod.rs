@@ -9,5 +9,6 @@
 
 pub mod qcow;
 pub mod raw;
+pub mod tensorlake;
 pub mod vhd;
 pub mod vhdx;

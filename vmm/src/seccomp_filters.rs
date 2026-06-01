@@ -686,6 +686,12 @@ fn vmm_thread_rules(
         (libc::SYS_madvise, vec![]),
         (libc::SYS_mbind, vec![]),
         (libc::SYS_memfd_create, vec![]),
+        // Virtio device threads inherit the VMM filter before applying their
+        // own thread filter. Keep Tensorlake live-index file operations here
+        // so inherited filtering does not block virtio-block.
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_mkdir, vec![]),
+        (libc::SYS_mkdirat, vec![]),
         (libc::SYS_mmap, vec![]),
         (libc::SYS_mprotect, vec![]),
         (libc::SYS_mremap, vec![]),
@@ -714,6 +720,10 @@ fn vmm_thread_rules(
         (libc::SYS_readlinkat, vec![]),
         (libc::SYS_recvfrom, vec![]),
         (libc::SYS_recvmsg, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_rename, vec![]),
+        (libc::SYS_renameat, vec![]),
+        (libc::SYS_renameat2, vec![]),
         (libc::SYS_restart_syscall, vec![]),
         (libc::SYS_rseq, vec![]),
         (libc::SYS_rt_sigaction, vec![]),
@@ -1110,5 +1120,127 @@ pub fn get_seccomp_filter(
         )
         .and_then(|filter| filter.try_into())
         .map_err(Error::Backend),
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "kvm")]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::ffi::CString;
+    use std::path::Path;
+
+    use seccompiler::apply_filter;
+
+    use super::*;
+
+    #[test]
+    fn vmm_filter_allows_tensorlake_live_index_syscalls_inherited_by_devices() {
+        let rules: BTreeMap<_, _> = get_seccomp_rules(Thread::Vmm, Some(HypervisorType::Kvm))
+            .expect("vmm seccomp rules")
+            .into_iter()
+            .collect();
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert!(rules.contains_key(&libc::SYS_mkdir));
+            assert!(rules.contains_key(&libc::SYS_rename));
+        }
+        assert!(rules.contains_key(&libc::SYS_mkdirat));
+        assert!(rules.contains_key(&libc::SYS_renameat));
+        assert!(rules.contains_key(&libc::SYS_renameat2));
+        assert!(rules.contains_key(&libc::SYS_statx));
+    }
+
+    #[test]
+    fn vmm_compiled_filter_allows_tensorlake_live_index_syscalls() {
+        let filter =
+            get_seccomp_filter(&SeccompAction::Trap, Thread::Vmm, Some(HypervisorType::Kvm))
+                .expect("build vmm seccomp filter");
+        let sandbox =
+            std::env::temp_dir().join(format!("ch-vmm-seccomp-test-{}", std::process::id()));
+
+        // SAFETY: fork is used to apply an irreversible seccomp filter in the child.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            if let Err(error) = apply_filter(&filter) {
+                eprintln!("apply_filter failed: {error:?}");
+                exit_child(100);
+            }
+
+            let dir = c_path(&sandbox);
+            // SAFETY: dir is a valid C string and mode is a plain value.
+            let mkdir_result = unsafe { libc::mkdir(dir.as_ptr(), 0o700) };
+            if mkdir_result != 0 {
+                eprintln!("mkdir failed: {}", std::io::Error::last_os_error());
+                exit_child(101);
+            }
+
+            let source = sandbox.join("source");
+            let dest = sandbox.join("dest");
+            std::fs::write(&source, b"data").expect("write source file");
+
+            let source_c = c_path(&source);
+            let dest_c = c_path(&dest);
+            // SAFETY: paths are valid C strings.
+            let rename_result = unsafe { libc::rename(source_c.as_ptr(), dest_c.as_ptr()) };
+            if rename_result != 0 {
+                eprintln!("rename failed: {}", std::io::Error::last_os_error());
+                exit_child(102);
+            }
+
+            verify_statx_is_allowed(&dest_c);
+
+            exit_child(0);
+        }
+
+        let mut status = 0;
+        // SAFETY: pid is a live child process.
+        let wait_result = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(wait_result, pid, "waitpid failed");
+        let _ = std::fs::remove_dir_all(&sandbox);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "child failed: status={status}"
+        );
+    }
+
+    fn c_path(path: &Path) -> CString {
+        CString::new(path.to_string_lossy().as_bytes()).expect("path contains no nul bytes")
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn verify_statx_is_allowed(path: &CString) {
+        // SAFETY: Intentionally pass a null statx buffer. When the syscall is
+        // allowed, the kernel returns EFAULT; if seccomp blocks it, the child
+        // exits due to SIGSYS before reaching this check.
+        let statx_result = unsafe {
+            libc::syscall(
+                libc::SYS_statx,
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                0,
+                0,
+                std::ptr::null_mut::<libc::c_void>(),
+            )
+        };
+        let error = std::io::Error::last_os_error();
+        if statx_result != -1 || error.raw_os_error() != Some(libc::EFAULT) {
+            eprintln!("statx failed unexpectedly: {error}");
+            exit_child(103);
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn verify_statx_is_allowed(_path: &CString) {}
+
+    fn exit_child(status: i32) -> ! {
+        // SAFETY: invoke the per-thread exit syscall so this test does not require
+        // permitting process-wide exit_group in the VMM policy.
+        unsafe {
+            libc::syscall(libc::SYS_exit, status);
+        }
+        unreachable!("SYS_exit returned")
     }
 }

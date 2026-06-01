@@ -121,13 +121,21 @@ fn virtio_block_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
         (libc::SYS_io_submit, vec![]),
         (libc::SYS_io_uring_enter, vec![]),
         (libc::SYS_lseek, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_mkdir, vec![]),
+        (libc::SYS_mkdirat, vec![]),
         (libc::SYS_pread64, vec![]),
         (libc::SYS_preadv, vec![]),
         (libc::SYS_pwritev, vec![]),
         (libc::SYS_pwrite64, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_rename, vec![]),
+        (libc::SYS_renameat, vec![]),
+        (libc::SYS_renameat2, vec![]),
         (libc::SYS_sched_getaffinity, vec![]),
         (libc::SYS_sched_setaffinity, vec![]),
         (libc::SYS_set_robust_list, vec![]),
+        (libc::SYS_statx, vec![]),
         (libc::SYS_timerfd_settime, vec![]),
     ]
 }
@@ -381,5 +389,121 @@ pub fn get_seccomp_filter(
         )
         .and_then(|filter| filter.try_into())
         .map_err(Error::Backend),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::ffi::CString;
+    use std::path::Path;
+
+    use seccompiler::{SeccompAction, apply_filter};
+
+    use super::*;
+
+    #[test]
+    fn virtio_block_filter_allows_tensorlake_live_index_syscalls() {
+        let rules: BTreeMap<_, _> = get_seccomp_rules(Thread::VirtioBlock).into_iter().collect();
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert!(rules.contains_key(&libc::SYS_mkdir));
+            assert!(rules.contains_key(&libc::SYS_rename));
+        }
+        assert!(rules.contains_key(&libc::SYS_mkdirat));
+        assert!(rules.contains_key(&libc::SYS_renameat));
+        assert!(rules.contains_key(&libc::SYS_renameat2));
+        assert!(rules.contains_key(&libc::SYS_statx));
+    }
+
+    #[test]
+    fn virtio_block_compiled_filter_allows_tensorlake_live_index_syscalls() {
+        let filter = get_seccomp_filter(&SeccompAction::Trap, Thread::VirtioBlock)
+            .expect("build virtio-block seccomp filter");
+        let sandbox = std::env::temp_dir().join(format!("ch-seccomp-test-{}", std::process::id()));
+
+        // SAFETY: fork is used to apply an irreversible seccomp filter in the child.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            if let Err(error) = apply_filter(&filter) {
+                eprintln!("apply_filter failed: {error:?}");
+                exit_child(100);
+            }
+
+            let dir = c_path(&sandbox);
+            // SAFETY: dir is a valid C string and mode is a plain value.
+            let mkdir_result = unsafe { libc::mkdir(dir.as_ptr(), 0o700) };
+            if mkdir_result != 0 {
+                eprintln!("mkdir failed: {}", std::io::Error::last_os_error());
+                exit_child(101);
+            }
+
+            let source = sandbox.join("source");
+            let dest = sandbox.join("dest");
+            std::fs::write(&source, b"data").expect("write source file");
+
+            let source_c = c_path(&source);
+            let dest_c = c_path(&dest);
+            // SAFETY: paths are valid C strings.
+            let rename_result = unsafe { libc::rename(source_c.as_ptr(), dest_c.as_ptr()) };
+            if rename_result != 0 {
+                eprintln!("rename failed: {}", std::io::Error::last_os_error());
+                exit_child(102);
+            }
+
+            verify_statx_is_allowed(&dest_c);
+
+            exit_child(0);
+        }
+
+        let mut status = 0;
+        // SAFETY: pid is a live child process.
+        let wait_result = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(wait_result, pid, "waitpid failed");
+        let _ = std::fs::remove_dir_all(&sandbox);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "child failed: status={status}"
+        );
+    }
+
+    fn c_path(path: &Path) -> CString {
+        CString::new(path.to_string_lossy().as_bytes()).expect("path contains no nul bytes")
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn verify_statx_is_allowed(path: &CString) {
+        // SAFETY: Intentionally pass a null statx buffer. When the syscall is
+        // allowed, the kernel returns EFAULT; if seccomp blocks it, the child
+        // exits due to SIGSYS before reaching this check.
+        let statx_result = unsafe {
+            libc::syscall(
+                libc::SYS_statx,
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                0,
+                0,
+                std::ptr::null_mut::<libc::c_void>(),
+            )
+        };
+        let error = std::io::Error::last_os_error();
+        if statx_result != -1 || error.raw_os_error() != Some(libc::EFAULT) {
+            eprintln!("statx failed unexpectedly: {error}");
+            exit_child(103);
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn verify_statx_is_allowed(_path: &CString) {}
+
+    fn exit_child(status: i32) -> ! {
+        // SAFETY: invoke the per-thread exit syscall so this test does not require
+        // permitting process-wide exit_group in the virtio-block seccomp policy.
+        unsafe {
+            libc::syscall(libc::SYS_exit, status);
+        }
+        unreachable!("SYS_exit returned")
     }
 }

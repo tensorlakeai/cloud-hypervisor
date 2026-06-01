@@ -22,6 +22,7 @@ use crate::disk_file::AsyncFullDiskFile;
 use crate::error::{BlockError, BlockErrorKind, BlockResult};
 use crate::formats::qcow::QcowDisk;
 use crate::formats::raw::{RawBackend, RawDisk};
+use crate::formats::tensorlake::TensorlakeRootfsDisk;
 use crate::formats::vhd::VhdDisk;
 use crate::formats::vhdx::VhdxDisk;
 use crate::{
@@ -31,6 +32,7 @@ use crate::{
 /// Options for opening a disk image via [`open_disk`].
 pub struct DiskOpenOptions<'a> {
     pub path: &'a Path,
+    pub image_type: ImageType,
     pub readonly: bool,
     pub direct: bool,
     pub sparse: bool,
@@ -90,6 +92,14 @@ pub fn open_disk(options: &DiskOpenOptions<'_>) -> BlockResult<OpenedDisk> {
         fs_options.custom_flags(libc::O_DIRECT);
     }
 
+    if options.image_type == ImageType::TensorlakeRootfs {
+        info!("Opening Tensorlake rootfs disk file with synchronous embedded overlay backend");
+        return Ok(OpenedDisk {
+            image_type: ImageType::TensorlakeRootfs,
+            disk: Box::new(TensorlakeRootfsDisk::open(options.path, options.readonly)?),
+        });
+    }
+
     let mut file = open_disk_image(options.path, &fs_options)?;
     let image_type = detect_image_type(&mut file)?;
 
@@ -97,6 +107,7 @@ pub fn open_disk(options: &DiskOpenOptions<'_>) -> BlockResult<OpenedDisk> {
         ImageType::FixedVhd => open_fixed_vhd(file, options)?,
         ImageType::Raw => open_raw(file, options)?,
         ImageType::Qcow2 => open_qcow2(file, options)?,
+        ImageType::TensorlakeRootfs => unreachable!("handled before image type detection"),
         ImageType::Vhdx => open_vhdx(file, options)?,
         ImageType::Unknown => {
             return Err(
@@ -216,6 +227,7 @@ mod unit_tests {
     fn default_options(path: &Path) -> DiskOpenOptions<'_> {
         DiskOpenOptions {
             path,
+            image_type: ImageType::Unknown,
             readonly: false,
             direct: false,
             sparse: false,
@@ -278,6 +290,7 @@ mod unit_tests {
         let path = tmp.as_path().to_owned();
         let options = DiskOpenOptions {
             path: &path,
+            image_type: ImageType::Unknown,
             readonly: false,
             direct: false,
             sparse: false,

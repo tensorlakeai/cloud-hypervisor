@@ -1,0 +1,157 @@
+name: Build Tensorlake Cloud Hypervisor image
+
+run-name: "Build and push Cloud Hypervisor image (${{ inputs.ref || github.ref_name }}, ${{ inputs.environment || 'both' }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref (branch, tag, or SHA) to build"
+        required: false
+        type: string
+        default: "tensorlake-rootfs-block"
+      environment:
+        description: "Target environment (dev, prod, or both)"
+        required: false
+        type: choice
+        options:
+          - both
+          - dev
+          - prod
+        default: "both"
+
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref (branch, tag, or SHA) to build"
+        required: false
+        type: string
+        default: "tensorlake-rootfs-block"
+      environment:
+        description: "Target environment (dev, prod, or both)"
+        required: false
+        type: string
+        default: "both"
+
+env:
+  IMAGE_NAME: cloud-hypervisor
+  AWS_REGION: us-east-1
+  GCP_REGION: us-central1
+  GCP_PROJECT: tensorlake-registry
+  GCP_REPOSITORY_PREFIX: images
+  RUST_TOOLCHAIN: "1.89.0"
+  TARGET: x86_64-unknown-linux-musl
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: build-cloud-hypervisor-image-${{ github.ref }}-${{ inputs.environment || 'both' }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    name: Build and push cloud-hypervisor image
+    runs-on: namespace-profile-rust-builder-amd64
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJson((inputs.environment || 'both') == 'both' && '["dev","prod"]' || format('["{0}"]', inputs.environment || 'both')) }}
+    environment: ${{ matrix.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.ref_name }}
+
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools libseccomp-dev libcap-ng-dev
+          rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal --target "${TARGET}"
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "true"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: github-actions-cloud-hypervisor
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Login to Google Artifact Registry
+        run: gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev
+
+      - name: Set GCP registry name output
+        id: gcp-registry
+        run: |
+          if [ "${{ matrix.environment }}" = "dev" ]; then
+            GCP_REPOSITORY="${{ env.GCP_REPOSITORY_PREFIX }}-dev"
+          else
+            GCP_REPOSITORY="${{ env.GCP_REPOSITORY_PREFIX }}"
+          fi
+          GCP_REGISTRY="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${GCP_REPOSITORY}"
+          echo "name=${GCP_REGISTRY}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Get checked-out commit SHA and branch
+        id: get-sha
+        run: |
+          sha="$(git rev-parse HEAD)"
+          short_sha="$(git rev-parse --short HEAD)"
+          ref="${{ inputs.ref || github.ref_name }}"
+          branch="$(echo "$ref" | sed 's/[^a-zA-Z0-9._-]/-/g')"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$short_sha" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Build Cloud Hypervisor
+        run: |
+          set -euxo pipefail
+          cargo +"${RUST_TOOLCHAIN}" build --locked --release --target "${TARGET}" \
+            --bin cloud-hypervisor \
+            --bin ch-remote
+
+      - name: Prepare Docker build
+        run: |
+          cat > Dockerfile.tensorlake <<'EOF'
+          FROM scratch
+          COPY target/x86_64-unknown-linux-musl/release/cloud-hypervisor /cloud-hypervisor
+          COPY target/x86_64-unknown-linux-musl/release/ch-remote /ch-remote
+          ENTRYPOINT ["/cloud-hypervisor"]
+          EOF
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.tensorlake
+          platforms: linux/amd64
+          push: true
+          cache-from: type=gha,scope=cloud-hypervisor
+          cache-to: type=gha,mode=max,scope=cloud-hypervisor
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}:${{ steps.get-sha.outputs.branch }}-${{ steps.get-sha.outputs.short_sha }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}:${{ steps.get-sha.outputs.sha }}
+            ${{ steps.gcp-registry.outputs.name }}/${{ env.IMAGE_NAME }}:${{ steps.get-sha.outputs.branch }}-${{ steps.get-sha.outputs.short_sha }}
+            ${{ steps.gcp-registry.outputs.name }}/${{ env.IMAGE_NAME }}:${{ steps.get-sha.outputs.sha }}

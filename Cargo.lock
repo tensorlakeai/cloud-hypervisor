@@ -350,6 +350,7 @@ dependencies = [
  "log",
  "remain",
  "serde",
+ "serde_json",
  "smallvec",
  "thiserror",
  "uuid",
