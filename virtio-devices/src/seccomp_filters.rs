@@ -124,6 +124,9 @@ fn virtio_block_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
         #[cfg(target_arch = "x86_64")]
         (libc::SYS_mkdir, vec![]),
         (libc::SYS_mkdirat, vec![]),
+        (libc::SYS_newfstatat, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_open, vec![]),
         (libc::SYS_pread64, vec![]),
         (libc::SYS_preadv, vec![]),
         (libc::SYS_pwritev, vec![]),
@@ -135,8 +138,14 @@ fn virtio_block_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
         (libc::SYS_sched_getaffinity, vec![]),
         (libc::SYS_sched_setaffinity, vec![]),
         (libc::SYS_set_robust_list, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_stat, vec![]),
         (libc::SYS_statx, vec![]),
         (libc::SYS_timerfd_settime, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_unlink, vec![]),
+        #[cfg(target_arch = "aarch64")]
+        (libc::SYS_unlinkat, vec![]),
     ]
 }
 
@@ -410,8 +419,13 @@ mod tests {
         {
             assert!(rules.contains_key(&libc::SYS_mkdir));
             assert!(rules.contains_key(&libc::SYS_rename));
+            assert!(rules.contains_key(&libc::SYS_stat));
+            assert!(rules.contains_key(&libc::SYS_unlink));
         }
         assert!(rules.contains_key(&libc::SYS_mkdirat));
+        assert!(rules.contains_key(&libc::SYS_newfstatat));
+        #[cfg(target_arch = "x86_64")]
+        assert!(rules.contains_key(&libc::SYS_open));
         assert!(rules.contains_key(&libc::SYS_renameat));
         assert!(rules.contains_key(&libc::SYS_renameat2));
         assert!(rules.contains_key(&libc::SYS_statx));
@@ -453,7 +467,16 @@ mod tests {
                 exit_child(102);
             }
 
+            verify_open_is_allowed(&dest_c);
             verify_statx_is_allowed(&dest_c);
+            verify_stat_is_allowed(&dest_c);
+
+            // SAFETY: path is a valid C string.
+            let unlink_result = unsafe { libc::unlink(dest_c.as_ptr()) };
+            if unlink_result != 0 {
+                eprintln!("unlink failed: {}", std::io::Error::last_os_error());
+                exit_child(104);
+            }
 
             exit_child(0);
         }
@@ -497,6 +520,39 @@ mod tests {
 
     #[cfg(not(target_arch = "x86_64"))]
     fn verify_statx_is_allowed(_path: &CString) {}
+
+    #[cfg(target_arch = "x86_64")]
+    fn verify_open_is_allowed(path: &CString) {
+        // SAFETY: path is a valid C string. Use the raw syscall so this test
+        // covers musl's SYS_open path even when the test binary is linked with
+        // a libc that implements open() through openat().
+        let fd = unsafe { libc::syscall(libc::SYS_open, path.as_ptr(), libc::O_RDONLY) };
+        if fd < 0 {
+            eprintln!("open syscall failed: {}", std::io::Error::last_os_error());
+            exit_child(106);
+        }
+        // SAFETY: fd was returned by open and is owned by this child.
+        unsafe {
+            libc::close(fd as libc::c_int);
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn verify_open_is_allowed(_path: &CString) {}
+
+    #[cfg(target_arch = "x86_64")]
+    fn verify_stat_is_allowed(path: &CString) {
+        let mut stat_buf = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: path is a valid C string and stat_buf points to writable memory.
+        let stat_result = unsafe { libc::stat(path.as_ptr(), stat_buf.as_mut_ptr()) };
+        if stat_result != 0 {
+            eprintln!("stat failed: {}", std::io::Error::last_os_error());
+            exit_child(105);
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn verify_stat_is_allowed(_path: &CString) {}
 
     fn exit_child(status: i32) -> ! {
         // SAFETY: invoke the per-thread exit syscall so this test does not require
